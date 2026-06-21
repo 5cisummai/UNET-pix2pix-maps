@@ -62,13 +62,17 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--discriminator-lr", type=float, default=2e-4)
     parser.add_argument("--beta1", type=float, default=0.5)
     parser.add_argument("--beta2", type=float, default=0.999)
-    parser.add_argument("--lambda-l1", type=float, default=50.0)
-    parser.add_argument("--lambda-edge", type=float, default=5.0)
+    parser.add_argument("--lambda-l1", type=float, default=100.0)
+    parser.add_argument("--lambda-edge", type=float, default=0.0)
+    parser.add_argument("--weight-decay", type=float, default=0.0)
     parser.add_argument("--gradient-clip-norm", type=float, default=1.0)
     parser.add_argument("--accumulation-steps", type=int, default=1)
+    parser.add_argument("--warmup-epochs", type=int, default=None)
+    parser.add_argument("--d-update-interval", type=int, default=1)
     parser.add_argument("--save-every", type=int, default=5)
     parser.add_argument("--sample-every", type=int, default=1)
     parser.add_argument("--patience", type=int, default=25)
+    parser.add_argument("--no-early-stopping", action="store_true", default=False)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--source-side", type=str, default="left", choices=["left", "right"])
     parser.add_argument("--resume", type=str, default=None)
@@ -260,12 +264,12 @@ def maybe_load_checkpoint(
     return start_epoch, best_val_l1, epochs_without_improvement
 
 
-def create_scheduler(optimizer: Adam, total_epochs: int) -> LambdaLR:
+def create_scheduler(optimizer: Adam, total_epochs: int, warmup_epochs: int | None = None) -> LambdaLR:
     def decay_lambda(epoch: int) -> float:
-        warm_epochs = total_epochs // 2
-        if epoch < warm_epochs:
+        warm = warmup_epochs if warmup_epochs is not None else total_epochs // 2
+        if epoch < warm:
             return 1.0
-        decay_progress = (epoch - warm_epochs) / max(1, total_epochs - warm_epochs)
+        decay_progress = (epoch - warm) / max(1, total_epochs - warm)
         return max(0.0, 1.0 - decay_progress)
 
     return LambdaLR(optimizer, lr_lambda=decay_lambda)
@@ -411,10 +415,10 @@ def train_worker(rank: int, world_size: int, port: int, args: argparse.Namespace
         generator = nn.DataParallel(generator)
         discriminator = nn.DataParallel(discriminator)
 
-    generator_optimizer = Adam(generator.parameters(), lr=args.generator_lr, betas=(args.beta1, args.beta2))
-    discriminator_optimizer = Adam(discriminator.parameters(), lr=args.discriminator_lr, betas=(args.beta1, args.beta2))
-    generator_scheduler = create_scheduler(generator_optimizer, args.epochs)
-    discriminator_scheduler = create_scheduler(discriminator_optimizer, args.epochs)
+    generator_optimizer = Adam(generator.parameters(), lr=args.generator_lr, betas=(args.beta1, args.beta2), weight_decay=args.weight_decay)
+    discriminator_optimizer = Adam(discriminator.parameters(), lr=args.discriminator_lr, betas=(args.beta1, args.beta2), weight_decay=args.weight_decay)
+    generator_scheduler = create_scheduler(generator_optimizer, args.epochs, args.warmup_epochs)
+    discriminator_scheduler = create_scheduler(discriminator_optimizer, args.epochs, args.warmup_epochs)
 
     adversarial_loss = nn.BCEWithLogitsLoss().to(device)
     reconstruction_loss = nn.L1Loss().to(device)
@@ -467,24 +471,28 @@ def train_worker(rank: int, world_size: int, port: int, args: argparse.Namespace
             if not torch.isfinite(source_images).all() or not torch.isfinite(target_images).all():
                 continue
 
+            update_d = step % args.d_update_interval == 0
+
             with autocast_context(device, amp_enabled):
                 generated_images = generator(source_images)
-                discriminator_real = discriminator(source_images, target_images)
-                discriminator_fake = discriminator(source_images, generated_images.detach())
-                valid_labels = torch.ones_like(discriminator_real)
-                fake_labels = torch.zeros_like(discriminator_fake)
-                discriminator_loss = 0.5 * (
-                    adversarial_loss(discriminator_real, valid_labels) +
-                    adversarial_loss(discriminator_fake, fake_labels)
-                )
-                discriminator_loss = discriminator_loss / args.accumulation_steps
+                if update_d:
+                    discriminator_real = discriminator(source_images, target_images)
+                    discriminator_fake = discriminator(source_images, generated_images.detach())
+                    valid_labels = torch.ones_like(discriminator_real)
+                    fake_labels = torch.zeros_like(discriminator_fake)
+                    discriminator_loss = 0.5 * (
+                        adversarial_loss(discriminator_real, valid_labels) +
+                        adversarial_loss(discriminator_fake, fake_labels)
+                    )
+                    discriminator_loss = discriminator_loss / args.accumulation_steps
 
-            if not torch.isfinite(discriminator_loss):
-                discriminator_optimizer.zero_grad(set_to_none=True)
-                generator_optimizer.zero_grad(set_to_none=True)
-                continue
+            if update_d:
+                if not torch.isfinite(discriminator_loss):
+                    discriminator_optimizer.zero_grad(set_to_none=True)
+                    generator_optimizer.zero_grad(set_to_none=True)
+                    continue
 
-            scaler.scale(discriminator_loss).backward()
+                scaler.scale(discriminator_loss).backward()
 
             with autocast_context(device, amp_enabled):
                 generated_images = generator(source_images)
@@ -515,7 +523,8 @@ def train_worker(rank: int, world_size: int, port: int, args: argparse.Namespace
                 discriminator_optimizer.zero_grad(set_to_none=True)
                 generator_optimizer.zero_grad(set_to_none=True)
 
-            running_metrics["discriminator_loss"] += float(discriminator_loss.item() * args.accumulation_steps)
+            if update_d:
+                running_metrics["discriminator_loss"] += float(discriminator_loss.item() * args.accumulation_steps)
             running_metrics["generator_loss"] += float(generator_loss.item() * args.accumulation_steps)
             running_metrics["gan_loss"] += float(gan_loss.item())
             running_metrics["l1_loss"] += float(l1_loss.item())
@@ -609,7 +618,7 @@ def train_worker(rank: int, world_size: int, port: int, args: argparse.Namespace
             summary = " ".join(f"{name}={value:.4f}" for name, value in metrics.items())
             print(f"Epoch {epoch + 1}: {summary}")
 
-            if val_loader is not None and args.patience > 0 and epochs_without_improvement >= args.patience:
+            if val_loader is not None and not args.no_early_stopping and args.patience > 0 and epochs_without_improvement >= args.patience:
                 should_stop = True
 
         if distributed:
