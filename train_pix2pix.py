@@ -50,7 +50,6 @@ def parse_args() -> argparse.Namespace:
             config_defaults = yaml.safe_load(config_file) or {}
 
     parser = argparse.ArgumentParser(description="Train a Pix2Pix-style UNet on the Maps dataset.")
-    parser.set_defaults(**config_defaults)
     parser.add_argument("--config", type=str, default=config_args.config)
     parser.add_argument("--data-root", type=str, required="data_root" not in config_defaults)
     parser.add_argument("--output-dir", type=str, default="runs/pix2pix_maps")
@@ -64,7 +63,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--beta1", type=float, default=0.5)
     parser.add_argument("--beta2", type=float, default=0.999)
     parser.add_argument("--lambda-l1", type=float, default=50.0)
-    parser.add_argument("--lambda-edge", type=float, default=10.0)
+    parser.add_argument("--lambda-edge", type=float, default=5.0)
     parser.add_argument("--gradient-clip-norm", type=float, default=1.0)
     parser.add_argument("--accumulation-steps", type=int, default=1)
     parser.add_argument("--save-every", type=int, default=5)
@@ -75,6 +74,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--resume", type=str, default=None)
     parser.add_argument("--amp", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--use-ddp", action=argparse.BooleanOptionalAction, default=True)
+    parser.set_defaults(**config_defaults)
     return parser.parse_args(remaining_args)
 
 
@@ -143,8 +143,14 @@ def denormalize_image(image_tensor: torch.Tensor) -> torch.Tensor:
 class SobelEdgeLoss(nn.Module):
     def __init__(self) -> None:
         super().__init__()
-        sobel_x = torch.tensor([[-1, 0, 1], [-2, 0, 2], [-1, 0, 1]], dtype=torch.float32).view(1, 1, 3, 3)
-        sobel_y = torch.tensor([[-1, -2, -1], [0, 0, 0], [1, 2, 1]], dtype=torch.float32).view(1, 1, 3, 3)
+        sobel_x = torch.tensor(
+            [[-1, 0, 1], [-2, 0, 2], [-1, 0, 1]],
+            dtype=torch.float32,
+        ).view(1, 1, 3, 3) / 8.0
+        sobel_y = torch.tensor(
+            [[-1, -2, -1], [0, 0, 0], [1, 2, 1]],
+            dtype=torch.float32,
+        ).view(1, 1, 3, 3) / 8.0
         self.register_buffer("sobel_x", sobel_x)
         self.register_buffer("sobel_y", sobel_y)
         self.l1_loss = nn.L1Loss()
@@ -158,12 +164,15 @@ class SobelEdgeLoss(nn.Module):
         gray_gen = self._to_grayscale(generated)
         gray_target = self._to_grayscale(target)
 
-        edge_gen_x = F.conv2d(gray_gen, self.sobel_x, padding=1)
-        edge_gen_y = F.conv2d(gray_gen, self.sobel_y, padding=1)
+        gray_gen = F.pad(gray_gen, (1, 1, 1, 1), mode="replicate")
+        gray_target = F.pad(gray_target, (1, 1, 1, 1), mode="replicate")
+
+        edge_gen_x = F.conv2d(gray_gen, self.sobel_x)
+        edge_gen_y = F.conv2d(gray_gen, self.sobel_y)
         edge_gen = torch.sqrt(edge_gen_x.pow(2) + edge_gen_y.pow(2) + 1e-6)
 
-        edge_target_x = F.conv2d(gray_target, self.sobel_x, padding=1)
-        edge_target_y = F.conv2d(gray_target, self.sobel_y, padding=1)
+        edge_target_x = F.conv2d(gray_target, self.sobel_x)
+        edge_target_y = F.conv2d(gray_target, self.sobel_y)
         edge_target = torch.sqrt(edge_target_x.pow(2) + edge_target_y.pow(2) + 1e-6)
 
         return self.l1_loss(edge_gen, edge_target)
@@ -334,9 +343,11 @@ def validate(
 ) -> dict[str, float]:
     generator.eval()
     l1_losses: list[float] = []
+    edge_losses: list[float] = []
     psnr_values: list[float] = []
     saved_preview = False
-    l1_loss = nn.L1Loss()
+    l1_loss = nn.L1Loss().to(device)
+    edge_loss = SobelEdgeLoss().to(device)
 
     with torch.no_grad():
         for batch in tqdm(val_loader, desc=f"Val {epoch}", leave=False):
@@ -346,8 +357,10 @@ def validate(
             with autocast_context(device, amp_enabled):
                 generated_images = generator(source_images)
                 batch_l1 = l1_loss(generated_images, target_images)
+                batch_edge = edge_loss(generated_images, target_images)
 
             l1_losses.append(float(batch_l1.item()))
+            edge_losses.append(float(batch_edge.item()))
             psnr_values.append(calculate_psnr(generated_images.float(), target_images.float()))
 
             if not saved_preview and is_main_process(rank):
@@ -362,6 +375,7 @@ def validate(
     generator.train()
     return {
         "val_l1": float(np.mean(l1_losses)) if l1_losses else math.inf,
+        "val_edge": float(np.mean(edge_losses)) if edge_losses else math.inf,
         "val_psnr": float(np.mean(psnr_values)) if psnr_values else 0.0,
     }
 
@@ -530,7 +544,7 @@ def train_worker(rank: int, world_size: int, port: int, args: argparse.Namespace
             validation_model = unwrap_model(generator) if distributed else generator
             metrics.update(validate(validation_model, val_loader, device, amp_enabled, rank, epoch + 1, output_dir))
         else:
-            metrics.update({"val_l1": math.inf, "val_psnr": 0.0})
+            metrics.update({"val_l1": math.inf, "val_edge": math.inf, "val_psnr": 0.0})
 
         if writer is not None:
             for metric_name, metric_value in metrics.items():
