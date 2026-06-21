@@ -478,8 +478,8 @@ def train_worker(rank: int, world_size: int, port: int, args: argparse.Namespace
                 if update_d:
                     discriminator_real = discriminator(source_images, target_images)
                     discriminator_fake = discriminator(source_images, generated_images.detach())
-                    valid_labels = torch.ones_like(discriminator_real)
                     fake_labels = torch.zeros_like(discriminator_fake)
+                    valid_labels = torch.ones_like(discriminator_real)
                     discriminator_loss = 0.5 * (
                         adversarial_loss(discriminator_real, valid_labels) +
                         adversarial_loss(discriminator_fake, fake_labels)
@@ -497,6 +497,7 @@ def train_worker(rank: int, world_size: int, port: int, args: argparse.Namespace
             with autocast_context(device, amp_enabled):
                 generated_images = generator(source_images)
                 discriminator_fake_for_generator = discriminator(source_images, generated_images)
+                valid_labels = torch.ones_like(discriminator_fake_for_generator)
                 gan_loss = adversarial_loss(discriminator_fake_for_generator, valid_labels)
                 l1_loss = reconstruction_loss(generated_images, target_images) * args.lambda_l1
                 edge = edge_loss(generated_images, target_images) * args.lambda_edge
