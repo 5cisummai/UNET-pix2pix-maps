@@ -14,7 +14,8 @@ import torch
 import torch.distributed as dist
 from PIL import Image
 from torch import nn
-from torch.cuda.amp import GradScaler, autocast
+from torch.amp import autocast
+from torch.cuda.amp import GradScaler
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.optim import Adam
 from torch.optim.lr_scheduler import LambdaLR
@@ -111,8 +112,13 @@ def get_free_port() -> int:
 def setup_distributed(rank: int, world_size: int, port: int) -> None:
     os.environ.setdefault("MASTER_ADDR", "127.0.0.1")
     os.environ.setdefault("MASTER_PORT", str(port))
-    dist.init_process_group(backend="nccl", rank=rank, world_size=world_size)
     torch.cuda.set_device(rank)
+    dist.init_process_group(
+        backend="nccl",
+        rank=rank,
+        world_size=world_size,
+        device_id=torch.device(f"cuda:{rank}"),
+    )
 
 
 def cleanup_distributed() -> None:
@@ -130,6 +136,10 @@ def unwrap_model(model: nn.Module) -> nn.Module:
 
 def denormalize_image(image_tensor: torch.Tensor) -> torch.Tensor:
     return image_tensor.mul(0.5).add(0.5).clamp(0.0, 1.0)
+
+
+def autocast_context(device: torch.device, enabled: bool):
+    return autocast(device_type=device.type, enabled=enabled)
 
 
 def save_preview(
@@ -302,7 +312,7 @@ def validate(
             source_images = batch["source"].to(device, non_blocking=True)
             target_images = batch["target"].to(device, non_blocking=True)
 
-            with autocast(enabled=amp_enabled):
+            with autocast_context(device, amp_enabled):
                 generated_images = generator(source_images)
                 batch_l1 = l1_loss(generated_images, target_images)
 
@@ -410,7 +420,7 @@ def train_worker(rank: int, world_size: int, port: int, args: argparse.Namespace
             if not torch.isfinite(source_images).all() or not torch.isfinite(target_images).all():
                 continue
 
-            with autocast(enabled=amp_enabled):
+            with autocast_context(device, amp_enabled):
                 generated_images = generator(source_images)
                 discriminator_real = discriminator(source_images, target_images)
                 discriminator_fake = discriminator(source_images, generated_images.detach())
@@ -429,7 +439,7 @@ def train_worker(rank: int, world_size: int, port: int, args: argparse.Namespace
 
             scaler.scale(discriminator_loss).backward()
 
-            with autocast(enabled=amp_enabled):
+            with autocast_context(device, amp_enabled):
                 generated_images = generator(source_images)
                 discriminator_fake_for_generator = discriminator(source_images, generated_images)
                 gan_loss = adversarial_loss(discriminator_fake_for_generator, valid_labels)
@@ -479,7 +489,10 @@ def train_worker(rank: int, world_size: int, port: int, args: argparse.Namespace
 
         validation_available = val_loader is not None and (epoch + 1) % args.sample_every == 0
         if validation_available:
-            metrics.update(validate(generator, val_loader, device, amp_enabled, rank, epoch + 1, output_dir))
+            if is_main_process(rank):
+                print(f"Starting validation for epoch {epoch + 1}...")
+            validation_model = unwrap_model(generator) if distributed else generator
+            metrics.update(validate(validation_model, val_loader, device, amp_enabled, rank, epoch + 1, output_dir))
         else:
             metrics.update({"val_l1": math.inf, "val_psnr": 0.0})
 
@@ -558,7 +571,6 @@ def train_worker(rank: int, world_size: int, port: int, args: argparse.Namespace
             best_val_l1 = float(sync_tensor[0].item())
             epochs_without_improvement = int(sync_tensor[1].item())
             should_stop = bool(sync_tensor[2].item())
-            dist.barrier()
 
         if should_stop:
             if is_main_process(rank):
