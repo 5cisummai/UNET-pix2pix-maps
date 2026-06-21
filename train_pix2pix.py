@@ -16,6 +16,7 @@ from PIL import Image
 from torch import nn
 from torch.amp import autocast
 from torch.cuda.amp import GradScaler
+import torch.nn.functional as F
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.optim import Adam
 from torch.optim.lr_scheduler import LambdaLR
@@ -62,7 +63,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--discriminator-lr", type=float, default=2e-4)
     parser.add_argument("--beta1", type=float, default=0.5)
     parser.add_argument("--beta2", type=float, default=0.999)
-    parser.add_argument("--lambda-l1", type=float, default=100.0)
+    parser.add_argument("--lambda-l1", type=float, default=50.0)
+    parser.add_argument("--lambda-edge", type=float, default=10.0)
     parser.add_argument("--gradient-clip-norm", type=float, default=1.0)
     parser.add_argument("--accumulation-steps", type=int, default=1)
     parser.add_argument("--save-every", type=int, default=5)
@@ -136,6 +138,35 @@ def unwrap_model(model: nn.Module) -> nn.Module:
 
 def denormalize_image(image_tensor: torch.Tensor) -> torch.Tensor:
     return image_tensor.mul(0.5).add(0.5).clamp(0.0, 1.0)
+
+
+class SobelEdgeLoss(nn.Module):
+    def __init__(self) -> None:
+        super().__init__()
+        sobel_x = torch.tensor([[-1, 0, 1], [-2, 0, 2], [-1, 0, 1]], dtype=torch.float32).view(1, 1, 3, 3)
+        sobel_y = torch.tensor([[-1, -2, -1], [0, 0, 0], [1, 2, 1]], dtype=torch.float32).view(1, 1, 3, 3)
+        self.register_buffer("sobel_x", sobel_x)
+        self.register_buffer("sobel_y", sobel_y)
+        self.l1_loss = nn.L1Loss()
+
+    def _to_grayscale(self, image: torch.Tensor) -> torch.Tensor:
+        if image.shape[1] == 1:
+            return image
+        return 0.2989 * image[:, 0:1] + 0.5870 * image[:, 1:2] + 0.1140 * image[:, 2:3]
+
+    def forward(self, generated: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
+        gray_gen = self._to_grayscale(generated)
+        gray_target = self._to_grayscale(target)
+
+        edge_gen_x = F.conv2d(gray_gen, self.sobel_x, padding=1)
+        edge_gen_y = F.conv2d(gray_gen, self.sobel_y, padding=1)
+        edge_gen = torch.sqrt(edge_gen_x.pow(2) + edge_gen_y.pow(2) + 1e-6)
+
+        edge_target_x = F.conv2d(gray_target, self.sobel_x, padding=1)
+        edge_target_y = F.conv2d(gray_target, self.sobel_y, padding=1)
+        edge_target = torch.sqrt(edge_target_x.pow(2) + edge_target_y.pow(2) + 1e-6)
+
+        return self.l1_loss(edge_gen, edge_target)
 
 
 def autocast_context(device: torch.device, enabled: bool):
@@ -373,6 +404,7 @@ def train_worker(rank: int, world_size: int, port: int, args: argparse.Namespace
 
     adversarial_loss = nn.BCEWithLogitsLoss().to(device)
     reconstruction_loss = nn.L1Loss().to(device)
+    edge_loss = SobelEdgeLoss().to(device)
     amp_enabled = bool(args.amp and device.type == "cuda")
     scaler = GradScaler(enabled=amp_enabled)
 
@@ -407,6 +439,7 @@ def train_worker(rank: int, world_size: int, port: int, args: argparse.Namespace
             "discriminator_loss": 0.0,
             "gan_loss": 0.0,
             "l1_loss": 0.0,
+            "edge_loss": 0.0,
         }
         step_count = 0
 
@@ -444,7 +477,8 @@ def train_worker(rank: int, world_size: int, port: int, args: argparse.Namespace
                 discriminator_fake_for_generator = discriminator(source_images, generated_images)
                 gan_loss = adversarial_loss(discriminator_fake_for_generator, valid_labels)
                 l1_loss = reconstruction_loss(generated_images, target_images) * args.lambda_l1
-                generator_loss = (gan_loss + l1_loss) / args.accumulation_steps
+                edge = edge_loss(generated_images, target_images) * args.lambda_edge
+                generator_loss = (gan_loss + l1_loss + edge) / args.accumulation_steps
 
             if not torch.isfinite(generator_loss):
                 discriminator_optimizer.zero_grad(set_to_none=True)
@@ -471,6 +505,7 @@ def train_worker(rank: int, world_size: int, port: int, args: argparse.Namespace
             running_metrics["generator_loss"] += float(generator_loss.item() * args.accumulation_steps)
             running_metrics["gan_loss"] += float(gan_loss.item())
             running_metrics["l1_loss"] += float(l1_loss.item())
+            running_metrics["edge_loss"] += float(edge.item())
             step_count += 1
 
             if is_main_process(rank):
@@ -479,6 +514,7 @@ def train_worker(rank: int, world_size: int, port: int, args: argparse.Namespace
                     "d_loss": f"{averaged_metrics['discriminator_loss']:.4f}",
                     "g_loss": f"{averaged_metrics['generator_loss']:.4f}",
                     "l1": f"{averaged_metrics['l1_loss']:.4f}",
+                    "edge": f"{averaged_metrics['edge_loss']:.4f}",
                 })
 
         generator_scheduler.step()
