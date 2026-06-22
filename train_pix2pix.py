@@ -65,7 +65,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--beta1", type=float, default=0.5)
     parser.add_argument("--beta2", type=float, default=0.999)
     parser.add_argument("--lambda-l1", type=float, default=100.0)
-    parser.add_argument("--lambda-edge", type=float, default=0.0)
+    parser.add_argument("--weighted-l1", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument("--road-mask-threshold", type=float, default=0.9)
+    parser.add_argument("--road-loss-weight", type=float, default=5.0)
+    parser.add_argument("--lambda-edge", type=float, default=0.1)
     parser.add_argument("--generator-norm", type=str, default="instance", choices=["batch", "instance"])
     parser.add_argument("--discriminator-norm", type=str, default="instance", choices=["batch", "instance"])
     parser.add_argument("--weight-decay", type=float, default=0.0)
@@ -146,6 +149,18 @@ def unwrap_model(model: nn.Module) -> nn.Module:
 
 def denormalize_image(image_tensor: torch.Tensor) -> torch.Tensor:
     return image_tensor.mul(0.5).add(0.5).clamp(0.0, 1.0)
+
+
+def weighted_reconstruction_loss(
+    generated: torch.Tensor,
+    target: torch.Tensor,
+    threshold: float,
+    road_weight: float,
+) -> torch.Tensor:
+    target_brightness = denormalize_image(target).mean(dim=1, keepdim=True)
+    road_mask = (target_brightness >= threshold).to(target.dtype)
+    pixel_weights = 1.0 + (road_weight - 1.0) * road_mask
+    return (generated - target).abs().mul(pixel_weights).mean()
 
 
 class SobelEdgeLoss(nn.Module):
@@ -507,7 +522,15 @@ def train_worker(rank: int, world_size: int, port: int, args: argparse.Namespace
                 discriminator_fake_for_generator = discriminator(source_images, generated_images)
                 valid_labels = torch.ones_like(discriminator_fake_for_generator)
                 gan_loss = adversarial_loss(discriminator_fake_for_generator, valid_labels)
-                l1_loss = reconstruction_loss(generated_images, target_images) * args.lambda_l1
+                reconstruction_term = reconstruction_loss(generated_images, target_images)
+                if args.weighted_l1:
+                    reconstruction_term = weighted_reconstruction_loss(
+                        generated_images,
+                        target_images,
+                        threshold=args.road_mask_threshold,
+                        road_weight=args.road_loss_weight,
+                    )
+                l1_loss = reconstruction_term * args.lambda_l1
                 edge = edge_loss(generated_images, target_images) * args.lambda_edge
                 generator_loss = (gan_loss + l1_loss + edge) / args.accumulation_steps
 
