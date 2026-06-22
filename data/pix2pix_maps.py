@@ -9,8 +9,16 @@ from PIL import Image
 from torch.utils.data import Dataset
 
 
-def _resize_image(image: Image.Image, size: tuple[int, int]) -> Image.Image:
-    return image.resize(size, Image.BICUBIC)
+_RESAMPLE_MAP = {
+    "nearest": Image.Resampling.NEAREST,
+    "bilinear": Image.Resampling.BILINEAR,
+    "bicubic": Image.Resampling.BICUBIC,
+    "lanczos": Image.Resampling.LANCZOS,
+}
+
+
+def _resize_image(image: Image.Image, size: tuple[int, int], interpolation: str = "bicubic") -> Image.Image:
+    return image.resize(size, _RESAMPLE_MAP[interpolation])
 
 
 def _to_tensor(image: Image.Image) -> torch.Tensor:
@@ -36,6 +44,8 @@ class Pix2PixMapsDataset(Dataset[dict[str, Any]]):
         load_size: int = 286,
         augment: bool = True,
         source_side: str = "left",
+        source_interpolation: str = "bicubic",
+        target_interpolation: str = "nearest",
     ) -> None:
         super().__init__()
         self.root_dir = Path(root_dir)
@@ -44,9 +54,15 @@ class Pix2PixMapsDataset(Dataset[dict[str, Any]]):
         self.load_size = load_size
         self.augment = augment
         self.source_side = source_side.lower()
+        self.source_interpolation = source_interpolation.lower()
+        self.target_interpolation = target_interpolation.lower()
 
         if self.source_side not in {"left", "right"}:
             raise ValueError("source_side must be 'left' or 'right'.")
+        if self.source_interpolation not in _RESAMPLE_MAP:
+            raise ValueError(f"Unsupported source_interpolation: {self.source_interpolation}")
+        if self.target_interpolation not in _RESAMPLE_MAP:
+            raise ValueError(f"Unsupported target_interpolation: {self.target_interpolation}")
 
         self.split_dir = self.root_dir / split
         if not self.split_dir.exists():
@@ -78,8 +94,8 @@ class Pix2PixMapsDataset(Dataset[dict[str, Any]]):
 
         if self.augment:
             resize_size = (self.load_size, self.load_size)
-            source_image = _resize_image(source_image, resize_size)
-            target_image = _resize_image(target_image, resize_size)
+            source_image = _resize_image(source_image, resize_size, self.source_interpolation)
+            target_image = _resize_image(target_image, resize_size, self.target_interpolation)
 
             crop_limit = self.load_size - self.image_size
             top = int(torch.randint(0, crop_limit + 1, (1,)).item())
@@ -94,8 +110,8 @@ class Pix2PixMapsDataset(Dataset[dict[str, Any]]):
                 target_image = target_image.transpose(Image.FLIP_LEFT_RIGHT)
         else:
             resize_size = (self.image_size, self.image_size)
-            source_image = _resize_image(source_image, resize_size)
-            target_image = _resize_image(target_image, resize_size)
+            source_image = _resize_image(source_image, resize_size, self.source_interpolation)
+            target_image = _resize_image(target_image, resize_size, self.target_interpolation)
 
         source_tensor = _normalize_image(_to_tensor(source_image))
         target_tensor = _normalize_image(_to_tensor(target_image))

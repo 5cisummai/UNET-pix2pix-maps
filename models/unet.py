@@ -4,14 +4,22 @@ import torch
 from torch import nn
 
 
+def _make_norm(norm_type: str, channels: int) -> nn.Module:
+    if norm_type == "batch":
+        return nn.BatchNorm2d(channels)
+    if norm_type == "instance":
+        return nn.InstanceNorm2d(channels)
+    raise ValueError(f"Unsupported norm_type: {norm_type}")
+
+
 class DownBlock(nn.Module):
-    def __init__(self, in_channels: int, out_channels: int, use_norm: bool = True) -> None:
+    def __init__(self, in_channels: int, out_channels: int, use_norm: bool = True, norm_type: str = "instance") -> None:
         super().__init__()
         layers: list[nn.Module] = [
             nn.Conv2d(in_channels, out_channels, kernel_size=4, stride=2, padding=1, bias=not use_norm),
         ]
         if use_norm:
-            layers.append(nn.BatchNorm2d(out_channels))
+            layers.append(_make_norm(norm_type, out_channels))
         layers.append(nn.LeakyReLU(0.2, inplace=True))
         self.block = nn.Sequential(*layers)
 
@@ -25,11 +33,12 @@ class UpBlock(nn.Module):
         in_channels: int,
         out_channels: int,
         use_dropout: bool = False,
+        norm_type: str = "instance",
     ) -> None:
         super().__init__()
         layers: list[nn.Module] = [
             nn.ConvTranspose2d(in_channels, out_channels, kernel_size=4, stride=2, padding=1, bias=False),
-            nn.BatchNorm2d(out_channels),
+            _make_norm(norm_type, out_channels),
             nn.ReLU(inplace=True),
         ]
         if use_dropout:
@@ -43,28 +52,28 @@ class UpBlock(nn.Module):
 class UNetGenerator(nn.Module):
     """Pix2Pix-style U-Net generator for paired image translation."""
 
-    def __init__(self, in_channels: int = 3, out_channels: int = 3, base_channels: int = 64) -> None:
+    def __init__(self, in_channels: int = 3, out_channels: int = 3, base_channels: int = 64, norm_type: str = "instance") -> None:
         super().__init__()
-        self.encoder1 = DownBlock(in_channels, base_channels, use_norm=False)
-        self.encoder2 = DownBlock(base_channels, base_channels * 2)
-        self.encoder3 = DownBlock(base_channels * 2, base_channels * 4)
-        self.encoder4 = DownBlock(base_channels * 4, base_channels * 8)
-        self.encoder5 = DownBlock(base_channels * 8, base_channels * 8)
-        self.encoder6 = DownBlock(base_channels * 8, base_channels * 8)
-        self.encoder7 = DownBlock(base_channels * 8, base_channels * 8)
+        self.encoder1 = DownBlock(in_channels, base_channels, use_norm=False, norm_type=norm_type)
+        self.encoder2 = DownBlock(base_channels, base_channels * 2, norm_type=norm_type)
+        self.encoder3 = DownBlock(base_channels * 2, base_channels * 4, norm_type=norm_type)
+        self.encoder4 = DownBlock(base_channels * 4, base_channels * 8, norm_type=norm_type)
+        self.encoder5 = DownBlock(base_channels * 8, base_channels * 8, norm_type=norm_type)
+        self.encoder6 = DownBlock(base_channels * 8, base_channels * 8, norm_type=norm_type)
+        self.encoder7 = DownBlock(base_channels * 8, base_channels * 8, norm_type=norm_type)
 
         self.bottleneck = nn.Sequential(
             nn.Conv2d(base_channels * 8, base_channels * 8, kernel_size=4, stride=2, padding=1),
             nn.ReLU(inplace=True),
         )
 
-        self.decoder1 = UpBlock(base_channels * 8, base_channels * 8, use_dropout=True)
-        self.decoder2 = UpBlock(base_channels * 16, base_channels * 8, use_dropout=True)
-        self.decoder3 = UpBlock(base_channels * 16, base_channels * 8, use_dropout=True)
-        self.decoder4 = UpBlock(base_channels * 16, base_channels * 8)
-        self.decoder5 = UpBlock(base_channels * 16, base_channels * 4)
-        self.decoder6 = UpBlock(base_channels * 8, base_channels * 2)
-        self.decoder7 = UpBlock(base_channels * 4, base_channels)
+        self.decoder1 = UpBlock(base_channels * 8, base_channels * 8, use_dropout=True, norm_type=norm_type)
+        self.decoder2 = UpBlock(base_channels * 16, base_channels * 8, use_dropout=True, norm_type=norm_type)
+        self.decoder3 = UpBlock(base_channels * 16, base_channels * 8, use_dropout=True, norm_type=norm_type)
+        self.decoder4 = UpBlock(base_channels * 16, base_channels * 8, norm_type=norm_type)
+        self.decoder5 = UpBlock(base_channels * 16, base_channels * 4, norm_type=norm_type)
+        self.decoder6 = UpBlock(base_channels * 8, base_channels * 2, norm_type=norm_type)
+        self.decoder7 = UpBlock(base_channels * 4, base_channels, norm_type=norm_type)
 
         self.output_block = nn.Sequential(
             nn.ConvTranspose2d(base_channels * 2, out_channels, kernel_size=4, stride=2, padding=1),

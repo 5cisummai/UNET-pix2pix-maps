@@ -56,6 +56,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--image-size", type=int, default=256)
     parser.add_argument("--load-size", type=int, default=286)
     parser.add_argument("--batch-size", type=int, default=1)
+    parser.add_argument("--source-interpolation", type=str, default="bicubic", choices=["nearest", "bilinear", "bicubic", "lanczos"])
+    parser.add_argument("--target-interpolation", type=str, default="nearest", choices=["nearest", "bilinear", "bicubic", "lanczos"])
     parser.add_argument("--num-workers", type=int, default=4)
     parser.add_argument("--epochs", type=int, default=200)
     parser.add_argument("--generator-lr", type=float, default=2e-4)
@@ -64,6 +66,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--beta2", type=float, default=0.999)
     parser.add_argument("--lambda-l1", type=float, default=100.0)
     parser.add_argument("--lambda-edge", type=float, default=0.0)
+    parser.add_argument("--generator-norm", type=str, default="instance", choices=["batch", "instance"])
+    parser.add_argument("--discriminator-norm", type=str, default="instance", choices=["batch", "instance"])
     parser.add_argument("--weight-decay", type=float, default=0.0)
     parser.add_argument("--gradient-clip-norm", type=float, default=1.0)
     parser.add_argument("--accumulation-steps", type=int, default=1)
@@ -295,6 +299,8 @@ def build_dataloaders(
         load_size=args.load_size,
         augment=True,
         source_side=args.source_side,
+        source_interpolation=args.source_interpolation,
+        target_interpolation=args.target_interpolation,
     )
     validation_split = resolve_validation_split(data_root)
     val_dataset = None
@@ -306,6 +312,8 @@ def build_dataloaders(
             load_size=args.load_size,
             augment=False,
             source_side=args.source_side,
+            source_interpolation=args.source_interpolation,
+            target_interpolation=args.target_interpolation,
         )
 
     train_sampler = DistributedSampler(train_dataset, num_replicas=world_size, rank=rank, shuffle=True) if world_size > 1 else None
@@ -403,8 +411,8 @@ def train_worker(rank: int, world_size: int, port: int, args: argparse.Namespace
 
     train_loader, val_loader, train_sampler = build_dataloaders(args, world_size, rank)
 
-    generator = UNetGenerator().to(device)
-    discriminator = PatchDiscriminator().to(device)
+    generator = UNetGenerator(norm_type=args.generator_norm).to(device)
+    discriminator = PatchDiscriminator(norm_type=args.discriminator_norm).to(device)
     generator.apply(init_weights)
     discriminator.apply(init_weights)
 

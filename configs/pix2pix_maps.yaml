@@ -2,6 +2,8 @@ data_root: /path/to/pix2pix/maps
 output_dir: runs/pix2pix_maps
 image_size: 256
 load_size: 286
+source_interpolation: bicubic
+target_interpolation: nearest
 batch_size: 1
 num_workers: 4
 epochs: 200
@@ -11,6 +13,8 @@ beta1: 0.5
 beta2: 0.999
 lambda_l1: 100.0
 lambda_edge: 0.0
+generator_norm: instance
+discriminator_norm: instance
 gradient_clip_norm: 1.0
 accumulation_steps: 1
 save_every: 5
